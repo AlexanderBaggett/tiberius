@@ -53,6 +53,7 @@ use std::cell::RefCell;
 use std::convert::From;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::marker::PhantomData;
+use std::mem;
 use std::ops::Deref;
 use std::io;
 use futures::{Async, BoxFuture, Future, Poll, Sink};
@@ -118,13 +119,14 @@ pub mod query;
 pub mod stmt;
 mod transaction;
 
-use transport::TdsTransport;
+use transport::{TdsTransport, TransportStream};
 use protocol::{PacketType, PreloginMessage, LoginMessage, SspiMessage, SerializeMessage, UnserializeMessage};
 use types::{ColumnData, ToSql};
 use tokens::{TdsResponseToken, RpcParam, RpcProcIdValue, RpcProcId, RpcOptionFlags, RpcStatusFlags, TokenRpcRequest, WriteToken};
 use query::{ResultSetStream, QueryStream, ExecFuture};
 use stmt::{Statement, StmtStream};
 use transaction::new_transaction;
+pub use protocol::EncryptionLevel;
 pub use transaction::Transaction;
 
 lazy_static! {
@@ -183,16 +185,18 @@ pub type TdsResult<T> = Result<T, TdsError>;
 
 /// A connection in a state before any login has happened
 #[doc(hidden)]
-enum SqlConnectionNewState {
+enum SqlConnectionNewState<I: Io> {
     PreLoginSend,
     PreLoginRecv,
+    #[cfg(feature = "tls")]
+    TLSPending(Option<transport::tls::ConnectAsync<transport::tls::TlsTdsWrapper<I>>>),
     LoginSend,
     LoginRecv,
     TokenStreamRecv,
     TokenStreamSend,
 }
 
-/// A representation of the initialization state of an SQL connection (pending authentication)
+/// A representation of the initialization state of an SQL connection (pending connection)
 pub enum SqlConnectionNew<I: BoxableIo, F: Future<Item=I, Error=TdsError> + Send + Sized> {
     Connection(Option<(F, ConnectParams)>),
     Error(Option<TdsError>),
@@ -211,7 +215,7 @@ impl<I: BoxableIo, F: Future<Item=I, Error=TdsError> + Send> Future for SqlConne
                     let future = SqlConnectionFuture {
                         params: pairs.take().map(|x| x.1).unwrap(),
                         state: SqlConnectionNewState::PreLoginSend,
-                        transport: TdsTransport::new(trans),
+                        transport: TdsTransport::new(TransportStream::Raw(trans)),
                         wauth_client: None,
                     };
                     SqlConnectionNew::Next(Some(future))
@@ -259,8 +263,8 @@ impl<'a> WinAuth<'a> {
 #[doc(hidden)]
 pub struct SqlConnectionFuture<I: BoxableIo> {
     params: ConnectParams,
-    state: SqlConnectionNewState,
-    transport: TdsTransport<I>,
+    state: SqlConnectionNewState<I>,
+    transport: TdsTransport<TransportStream<I>>,
     wauth_client: Option<WinAuth<'static>>,
 }
 
@@ -278,10 +282,14 @@ impl<I: BoxableIo> Future for SqlConnectionFuture<I> {
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         loop {
-            match self.state {
+            self.state = match self.state {
                 SqlConnectionNewState::PreLoginSend => {
-                    try_nb!(self.queue_simple_message(PreloginMessage::new()));
-                    self.state = SqlConnectionNewState::PreLoginRecv;
+                    let mut msg = PreloginMessage::new();
+                    if cfg!(feature = "tls") {
+                        msg.encryption = self.params.ssl;
+                    }
+                    try_nb!(self.queue_simple_message(msg));
+                    SqlConnectionNewState::PreLoginRecv
                 },
                 SqlConnectionNewState::PreLoginRecv => {
                     try_ready!(self.transport.inner.poll_complete());
@@ -290,7 +298,31 @@ impl<I: BoxableIo> Future for SqlConnectionFuture<I> {
                     // parse the prelogin packet
                     let buf = self.transport.inner.get_packet(header.length as usize);
                     let msg = try!(buf.as_ref().unserialize_message(&mut self.transport));
-                    self.state = SqlConnectionNewState::LoginSend;
+                    // move to an TLS stream, if requested
+                    match self.params.ssl {
+                        EncryptionLevel::On | EncryptionLevel::Required => {
+                            match mem::replace(&mut self.transport.inner.io, TransportStream::None) {
+                                TransportStream::Raw(stream) => {
+                                    let wrapped_stream = transport::tls::TlsTdsWrapper::new(stream, self.transport.inner.next_packet_id);
+                                    let tls_stream = transport::tls::connect_async(wrapped_stream, "TODO");
+                                    SqlConnectionNewState::TLSPending(Some(tls_stream))
+                                },
+                                _ => unreachable!(),
+                            }
+                        },
+                        _ => SqlConnectionNewState::LoginSend
+                    }
+                },
+                #[cfg(feature = "tls")]
+                SqlConnectionNewState::TLSPending(ref mut connect_async) => {
+                    assert!(connect_async.is_some());
+                    println!("TLS upgrade");
+                    let mut stream = try_ready!(connect_async.as_mut().unwrap().poll());
+                    println!("done");
+                    connect_async.take();
+                    stream.get_mut().get_mut().wrap_id = None;
+                    self.transport.inner.io = TransportStream::TLS(stream);
+                    SqlConnectionNewState::LoginSend
                 },
                 SqlConnectionNewState::LoginSend => {
                     let mut login_message = LoginMessage::new();
@@ -322,13 +354,13 @@ impl<I: BoxableIo> Future for SqlConnectionFuture<I> {
                     }
 
                     try_nb!(self.queue_simple_message(login_message));
-                    self.state = SqlConnectionNewState::LoginRecv;
+                    SqlConnectionNewState::LoginRecv
                 },
                 SqlConnectionNewState::LoginRecv => {
                     try_ready!(self.transport.inner.poll_complete());
                     let header = try_ready!(self.transport.inner.next_packet());
                     assert_eq!(header.ty, PacketType::TabularResult);
-                    self.state = SqlConnectionNewState::TokenStreamRecv;
+                    SqlConnectionNewState::TokenStreamRecv
                 },
                 SqlConnectionNewState::TokenStreamRecv => {
                     let token = try_ready!(self.transport.next_token());
@@ -338,9 +370,12 @@ impl<I: BoxableIo> Future for SqlConnectionFuture<I> {
                             match try!(self.wauth_client.as_mut().unwrap().next_bytes(Some(bytes.as_ref()))) {
                                 Some(bytes) => {
                                     try!(self.queue_simple_message(SspiMessage(bytes)));
-                                    self.state = SqlConnectionNewState::TokenStreamSend;
+                                    SqlConnectionNewState::TokenStreamSend
                                 },
-                                None => self.wauth_client = None,
+                                None => {
+                                    self.wauth_client = None;
+                                    SqlConnectionNewState::TokenStreamRecv
+                                }
                             }
                         },
                         Some(TdsResponseToken::Done(done)) => {
@@ -348,15 +383,14 @@ impl<I: BoxableIo> Future for SqlConnectionFuture<I> {
                             assert_eq!(done.status, tokens::DoneStatus::empty());
                             break;
                         },
-                        Some(x) => /*trace!("init/got token {:?}", x)*/(),
-                        None => (),
+                        Some(_) | None => SqlConnectionNewState::TokenStreamRecv,
                     }
                 },
                 SqlConnectionNewState::TokenStreamSend => {
                     try_ready!(self.transport.inner.poll_complete());
-                    self.state = SqlConnectionNewState::TokenStreamRecv;
+                    SqlConnectionNewState::TokenStreamRecv
                 }
-            }
+            };
         }
 
         Ok(Async::Ready(()))
@@ -373,7 +407,7 @@ pub trait StmtResult<I: BoxableIo> {
 /// A representation of an authenticated and ready for use SQL connection
 #[doc(hidden)]
 pub struct InnerSqlConnection<I: BoxableIo> {
-    transport: TdsTransport<I>,
+    transport: TdsTransport<TransportStream<I>>,
 }
 
 /// A connection to a SQL server with an underlying IO (e.g. socket)
@@ -433,6 +467,7 @@ pub enum AuthMethod {
 
 /// Settings for the connection, everything that isn't IO/transport specific (e.g. authentication)
 pub struct ConnectParams {
+    pub ssl: EncryptionLevel,
     pub auth: AuthMethod,
     pub target_db: Option<Cow<'static, str>>,
 }
@@ -485,9 +520,13 @@ impl<'a> ToConnectEndpoint<Box<BoxableIo>, DynamicConnectionTarget> for &'a str 
 
         let mut target: Option<DynamicConnectionTarget> = None;
         let mut connect_params = ConnectParams {
+            ssl: EncryptionLevel::NotSupported,
             auth: AuthMethod::SqlServer("".into(), "".into()),
             target_db: None,
         };
+        if cfg!(feature = "tls") {
+            connect_params.ssl = EncryptionLevel::Required;
+        }
 
         while !input.is_empty() {
             let key_end = input.bytes().position(|x| x == b'=');
@@ -597,7 +636,8 @@ impl<I: BoxableIo + Sized + 'static> SqlConnection<I> {
             Err(x) => return SqlConnectionNew::Error(Some(x)),
             Ok(x) => x,
         };
-        SqlConnectionNew::Connection(Some((target.to_io(&handle), params)))
+        let stream = target.to_io(&handle);
+        SqlConnectionNew::Connection(Some((stream, params)))
     }
 
     fn queue_sql_batch<'a, S>(&self, stmt: S) -> TdsResult<()> where S: Into<Cow<'a, str>> {
